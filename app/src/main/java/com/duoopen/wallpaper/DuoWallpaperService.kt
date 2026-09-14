@@ -2,6 +2,7 @@ package com.duoopen.wallpaper
 
 import android.graphics.Bitmap
 import android.graphics.BitmapShader
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -10,9 +11,11 @@ import android.graphics.Shader
 import android.service.wallpaper.WallpaperService
 import android.util.Log
 import android.view.SurfaceHolder
+import com.duoopen.fold.DualHingeSource
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.HingeAngleSource
 import com.duoopen.fold.TiltFollower
+import com.duoopen.fold.TriShader
 import com.duoopen.fold.isInnerPanel
 import com.duoopen.overlay.OverlayState
 import com.duoopen.settings.DuoConfig
@@ -45,6 +48,13 @@ class DuoWallpaperService : WallpaperService() {
         private val paint = Paint(Paint.FILTER_BITMAP_FLAG)
         private val follower = TiltFollower { draw() }
 
+        // Tri-fold (two-hinge / three-pane) path; active when [triMode] is true.
+        private val dualHingeProbe = DualHingeSource(context) { left, right -> onHingesAngle(left, right) }
+        private val triMode = dualHingeProbe.isTriFold
+        private val triShader: RuntimeShader? = if (triMode) TriShader.create(context) else null
+        private val followerLeft = TiltFollower { draw() }
+        private val followerRight = TiltFollower { draw() }
+
         private var config: DuoConfig = DuoSettings.config.value
         private var bitmap: Bitmap? = null
         private var bitmapVersion = -1L
@@ -63,12 +73,17 @@ class DuoWallpaperService : WallpaperService() {
             // OnePlus Open's hinge HAL sends nothing on registration, so a
             // listener started at unfold time would miss a fast open entirely.
             // It's on-change, so it's silent unless the hinge actually moves.
-            hinge.start()
+            if (triMode) dualHingeProbe.start() else hinge.start()
             scope.launch {
                 DuoSettings.config.collect { c ->
                     config = c
                     if (c.imageVersion != bitmapVersion) loadImage(c.imageVersion)
-                    follower.snap(tiltFor(hinge.lastAngle))
+                    if (triMode) {
+                        followerLeft.snap(TriShader.tiltForHinge(dualHingeProbe.lastAngleLeft, c))
+                        followerRight.snap(TriShader.tiltForHinge(dualHingeProbe.lastAngleRight, c))
+                    } else {
+                        follower.snap(tiltFor(hinge.lastAngle))
+                    }
                     draw()
                 }
             }
@@ -76,18 +91,27 @@ class DuoWallpaperService : WallpaperService() {
         }
 
         override fun onDestroy() {
-            hinge.stop()
+            if (triMode) dualHingeProbe.stop() else hinge.stop()
             follower.cancel()
+            followerLeft.cancel()
+            followerRight.cancel()
             scope.cancel()
             super.onDestroy()
         }
 
         override fun onVisibilityChanged(visible: Boolean) {
             if (visible) {
-                follower.snap(follower.target)
+                if (triMode) {
+                    followerLeft.snap(followerLeft.target)
+                    followerRight.snap(followerRight.target)
+                } else {
+                    follower.snap(follower.target)
+                }
                 draw()
             } else {
                 follower.cancel()
+                followerLeft.cancel()
+                followerRight.cancel()
             }
         }
 
@@ -100,19 +124,38 @@ class DuoWallpaperService : WallpaperService() {
             rebuildImageShader()
             // Folded -> unfolding swaps panels: start from the current hinge
             // pose instead of animating in from a stale value.
-            follower.snap(follower.target)
+            if (triMode) {
+                followerLeft.snap(followerLeft.target)
+                followerRight.snap(followerRight.target)
+            } else {
+                follower.snap(follower.target)
+            }
             draw()
         }
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             surfaceReady = false
             follower.cancel()
+            followerLeft.cancel()
+            followerRight.cancel()
             super.onSurfaceDestroyed(holder)
         }
 
         private fun onHingeAngle(angle: Float) {
             val tilt = tiltFor(angle)
             if (isInner() && isVisible && surfaceReady) follower.setTarget(tilt) else follower.snap(tilt)
+        }
+
+        private fun onHingesAngle(left: Float, right: Float) {
+            val tl = TriShader.tiltForHinge(left, config)
+            val tr = TriShader.tiltForHinge(right, config)
+            if (isVisible && surfaceReady) {
+                followerLeft.setTarget(tl)
+                followerRight.setTarget(tr)
+            } else {
+                followerLeft.snap(tl)
+                followerRight.snap(tr)
+            }
         }
 
         private fun tiltFor(angle: Float): Float =
@@ -158,19 +201,42 @@ class DuoWallpaperService : WallpaperService() {
             try {
                 canvas.drawColor(Color.BLACK)
                 val image = imageShader ?: return
-                val shader = foldShader
-                val tilt = if (isInner() && !OverlayState.running.value) follower.current else 0f
-                if (shader == null || tilt < DuoShader.FLAT_EPSILON) {
-                    paint.shader = image
+                if (triMode) {
+                    drawTri(canvas, image)
                 } else {
-                    val fold = DuoShader.centeredFold(width, height, config.foldSplitsLong)
-                    DuoShader.setUniforms(shader, width, height, tilt, config, pxPerMm, fold)
-                    shader.setInputShader("content", image)
-                    paint.shader = shader
+                    drawBook(canvas, image)
                 }
                 canvas.drawRect(0f, 0f, width, height, paint)
             } finally {
                 holder.unlockCanvasAndPost(canvas)
+            }
+        }
+
+        private fun drawBook(canvas: Canvas, image: BitmapShader) {
+            val shader = foldShader
+            val tilt = if (isInner() && !OverlayState.running.value) follower.current else 0f
+            if (shader == null || tilt < DuoShader.FLAT_EPSILON) {
+                paint.shader = image
+            } else {
+                val fold = DuoShader.centeredFold(width, height, config.foldSplitsLong)
+                DuoShader.setUniforms(shader, width, height, tilt, config, pxPerMm, fold)
+                shader.setInputShader("content", image)
+                paint.shader = shader
+            }
+        }
+
+        private fun drawTri(canvas: Canvas, image: BitmapShader) {
+            val shader = triShader
+            val overlayRunning = OverlayState.running.value
+            val tl = if (overlayRunning) 0f else followerLeft.current
+            val tr = if (overlayRunning) 0f else followerRight.current
+            if (shader == null || (tl < TriShader.FLAT_EPSILON && tr < TriShader.FLAT_EPSILON)) {
+                paint.shader = image
+            } else {
+                val fold = TriShader.triFold(width, height, config.foldSplitsLong)
+                TriShader.setUniforms(shader, width, height, tl, tr, config, pxPerMm, fold)
+                shader.setInputShader("content", image)
+                paint.shader = shader
             }
         }
     }

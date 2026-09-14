@@ -52,6 +52,19 @@ fun ControlSheet(
     onEnableOverlay: () -> Unit,
     onTestOverlay: () -> Unit,
     onDismiss: () -> Unit,
+    triMode: Boolean = false,
+    deviceTri: Boolean = false,
+    simulateTri: Boolean = false,
+    onSimulateTriChange: (Boolean) -> Unit = {},
+    hingeSensorNames: List<String> = emptyList(),
+    hingeLeft: Float = Float.NaN,
+    hingeRight: Float = Float.NaN,
+    tiltLeft: Float = 0f,
+    tiltRight: Float = 0f,
+    simulatedLeft: Float = 120f,
+    simulatedRight: Float = 150f,
+    onSimulatedLeftChange: (Float) -> Unit = {},
+    onSimulatedRightChange: (Float) -> Unit = {},
 ) {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -90,60 +103,107 @@ fun ControlSheet(
 
             Text("Unfold effect", style = MaterialTheme.typography.titleLarge)
             Spacer(Modifier.height(4.dp))
-            Text(
-                if (sensorName != null) "Hinge sensor: $sensorName" else "No hinge sensor found on this device",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                "Hinge ${if (hingeAngle.isNaN()) "—" else "${hingeAngle.roundToInt()}°"}  ·  pane tilt %.1f°".format(paneTilt),
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            if (triMode) {
+                val names = hingeSensorNames
+                Text(
+                    if (names.isEmpty()) {
+                        if (deviceTri) "Two hinge sensors found (names unavailable)" else "Tri-fold preview (no dual hinge sensor)"
+                    } else {
+                        "Hinges: ${names.joinToString(" · ")}"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "H1 ${if (hingeLeft.isNaN()) "—" else "${hingeLeft.roundToInt()}°"}  ·  " +
+                        "H2 ${if (hingeRight.isNaN()) "—" else "${hingeRight.roundToInt()}°"}  ·  " +
+                        "tilt %.1f° / %.1f°".format(tiltLeft, tiltRight),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Simulate tri-fold", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                    Switch(
+                        checked = simulateTri,
+                        onCheckedChange = onSimulateTriChange,
+                        enabled = !deviceTri,
+                    )
+                }
+                if (simulateTri || !deviceTri) {
+                    LabeledSlider(
+                        label = "H1 angle (left)",
+                        valueText = "${simulatedLeft.roundToInt()}°",
+                        value = simulatedLeft,
+                        onValueChange = onSimulatedLeftChange,
+                        range = 0f..180f,
+                    )
+                    LabeledSlider(
+                        label = "H2 angle (right)",
+                        valueText = "${simulatedRight.roundToInt()}°",
+                        value = simulatedRight,
+                        onValueChange = onSimulatedRightChange,
+                        range = 0f..180f,
+                    )
+                }
+            } else {
+                Text(
+                    if (sensorName != null) "Hinge sensor: $sensorName" else "No hinge sensor found on this device",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "Hinge ${if (hingeAngle.isNaN()) "—" else "${hingeAngle.roundToInt()}°"}  ·  pane tilt %.1f°".format(paneTilt),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
-            Spacer(Modifier.height(12.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Simulate hinge", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
-                Switch(
-                    checked = simulate,
-                    onCheckedChange = onSimulateChange,
-                    enabled = sensorName != null,
-                )
-            }
-            if (simulate) {
-                LabeledSlider(
-                    label = "Hinge angle",
-                    valueText = "${simulatedAngle.roundToInt()}°",
-                    value = simulatedAngle,
-                    onValueChange = onSimulatedAngleChange,
-                    range = 60f..180f,
-                )
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Simulate hinge", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                    Switch(
+                        checked = simulate,
+                        onCheckedChange = onSimulateChange,
+                        enabled = sensorName != null,
+                    )
+                }
+                if (simulate) {
+                    LabeledSlider(
+                        label = "Hinge angle",
+                        valueText = "${simulatedAngle.roundToInt()}°",
+                        value = simulatedAngle,
+                        onValueChange = onSimulatedAngleChange,
+                        range = 60f..180f,
+                    )
+                }
             }
 
             HorizontalDivider(Modifier.padding(vertical = 12.dp))
 
-            Text("Moving half", style = MaterialTheme.typography.titleSmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(-1 to "Left", 1 to "Right", 0 to "Both").forEach { (side, label) ->
-                    FilterChip(
-                        selected = config.movingSide == side,
-                        onClick = { DuoSettings.update { it.copy(movingSide = side) } },
-                        label = { Text(label) },
-                    )
+            if (!triMode) {
+                Text("Moving half", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(-1 to "Left", 1 to "Right", 0 to "Both").forEach { (side, label) ->
+                        FilterChip(
+                            selected = config.movingSide == side,
+                            onClick = { DuoSettings.update { it.copy(movingSide = side) } },
+                            label = { Text(label) },
+                        )
+                    }
                 }
-            }
-            Spacer(Modifier.height(8.dp))
-            Text("Cover screen frost from", style = MaterialTheme.typography.titleSmall)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(true to "Right", false to "Left").forEach { (fromRight, label) ->
-                    FilterChip(
-                        selected = config.coverFrostFromRight == fromRight,
-                        onClick = { DuoSettings.update { it.copy(coverFrostFromRight = fromRight) } },
-                        label = { Text(label) },
-                    )
+                Spacer(Modifier.height(8.dp))
+                Text("Cover screen frost from", style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(true to "Right", false to "Left").forEach { (fromRight, label) ->
+                        FilterChip(
+                            selected = config.coverFrostFromRight == fromRight,
+                            onClick = { DuoSettings.update { it.copy(coverFrostFromRight = fromRight) } },
+                            label = { Text(label) },
+                        )
+                    }
                 }
+                Spacer(Modifier.height(8.dp))
             }
-            Spacer(Modifier.height(8.dp))
 
             LabeledSlider(
                 label = "Strength",

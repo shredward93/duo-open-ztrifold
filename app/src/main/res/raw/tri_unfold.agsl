@@ -1,0 +1,122 @@
+// Tri-Unfold — three-pane variant of the Duo-Unfold frosted-glass shader
+// (github.com/Atomicx7/Duo-animation), for U-fold tri-foldables such as the
+// Samsung Galaxy Z TriFold.
+//
+// Model:
+// - UI content lives on a fixed plane: where the screen would be if fully flat.
+// - Eye is stationary on that plane's normal through the center pane (how you
+//   naturally look down into a half-open tri-fold), eyeDistancePx back.
+// - The display is three vertical panes: left (hinged at hingePosLeft, outer
+//   edge at x=0), center (anchored flat), right (hinged at hingePosRight, outer
+//   edge at x=size.x). The center pane never tilts and renders crisp.
+// - The left pane rotates `tiltLeft` around its hinge; the right pane rotates
+//   `tiltRight` around its hinge. Each pane's outer edge rises toward the
+//   viewer as its hinge closes.
+// - Per pixel in a side pane: ray eye -> glass point, continued to the UI
+//   plane; Vogel-disk blur with radius proportional to the glass-to-plane gap,
+//   dimmed in proportion to how much it scatters. A fully-missed kernel is
+//   black.
+//
+// Uniforms:
+// - tiltLeft, tiltRight: per-pane tilt, 0 = flat (effect off on that pane).
+// - hingePosLeft, hingePosRight: hinge x-positions in the hinge frame
+//   (default w/3 and 2w/3 for a symmetric tri-fold).
+// - eyeX: eye position along the split axis (default the center-pane center).
+// - axisSwap: 0 = hinges are vertical lines (split x), 1 = horizontal (split y).
+// - blurSpread: blur radius gained per px of glass/plane separation.
+// - darkening: fraction of light lost per px of blur radius.
+//
+// NOTE: minimal AGSL constructs on purpose (no break/continue, no bool locals,
+// no helper functions) — same constraint the original documents for on-device
+// compilers.
+
+uniform shader content;
+uniform float2 resolution;
+uniform float tiltLeft;
+uniform float tiltRight;
+uniform float eyeDistancePx;
+uniform float hingePosLeft;
+uniform float hingePosRight;
+uniform float eyeX;
+uniform float axisSwap;
+uniform float blurSpread;
+uniform float darkening;
+
+const float GOLDEN_ANGLE = 2.39996322972865332; // radians, Vogel disk spacing
+const float TWO_PI = 6.28318530717958648;
+
+half4 main(float2 fragCoord) {
+    if (resolution.x <= 1.0 || resolution.y <= 1.0) {
+        return content.eval(fragCoord);
+    }
+
+    // Work in a frame where the hinges are vertical lines.
+    float2 p = mix(fragCoord, fragCoord.yx, axisSwap);
+    float2 size = mix(resolution, resolution.yx, axisSwap);
+
+    float tiltL = radians(clamp(tiltLeft, 0.0, 60.0));
+    float tiltR = radians(clamp(tiltRight, 0.0, 60.0));
+
+    // Center pane: anchored and crisp regardless of either tilt.
+    if (p.x >= hingePosLeft && p.x <= hingePosRight) {
+        return content.eval(fragCoord);
+    }
+
+    // Left pane (outer edge at x < hingePosLeft) vs right pane (x > hingePosRight).
+    // side = -1 left, +1 right. Pick the matching hinge and tilt.
+    float side = mix(-1.0, 1.0, step(hingePosRight, p.x));
+    float hinge = mix(hingePosLeft, hingePosRight, step(0.5, side * 0.5 + 0.5));
+    float tilt = mix(tiltL, tiltR, step(0.5, side * 0.5 + 0.5));
+
+    if (tilt < 1e-4) {
+        return content.eval(fragCoord);
+    }
+
+    float d = abs(p.x - hinge);                     // distance from hinge along the glass
+    // Glass rotated `tilt` around the hinge line, outer edge rising toward the viewer.
+    float2 glass = float2(hinge + side * d * cos(tilt), p.y);
+    float gap = d * sin(tilt);
+    float2 eye = float2(eyeX, size.y * 0.5);
+
+    // Ray eye -> glass pixel, continued to the UI plane z = 0.
+    float depth = eyeDistancePx - gap;
+    if (depth <= 1e-3) {
+        return half4(0.0, 0.0, 0.0, 1.0);
+    }
+    float2 hitS = eye + (glass - eye) * (eyeDistancePx / depth);
+
+    float radius = blurSpread * gap;
+
+    // Whole blur kernel misses the UI: black.
+    if (hitS.x < -radius || hitS.y < -radius ||
+        hitS.x > size.x + radius || hitS.y > size.y + radius) {
+        return half4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    float2 hit = mix(hitS, hitS.yx, axisSwap);
+
+    // Frosted glass absorbs: dim in proportion to how much it scatters.
+    float atten = max(1.0 - darkening * radius, 0.0);
+
+    if (radius < 0.5) {
+        return half4(content.eval(hit).rgb * half(atten), 1.0);
+    }
+
+    // Vogel disk with per-pixel rotation (banding becomes frosted-glass grain).
+    // Fixed 32-iteration loop with a weight mask (no break) keeps frames cheap
+    // near the hinge and compiles everywhere.
+    float tapsF = clamp(radius * 2.0, 6.0, 32.0);
+    float rotation = fract(sin(dot(fragCoord, float2(12.9898, 78.233))) * 43758.5453) * TWO_PI;
+    half3 sum = half3(0.0);
+    float wsum = 0.0;
+    for (int i = 0; i < 32; i++) {
+        float fi = float(i);
+        float w = 1.0 - step(tapsF, fi);
+        float r = radius * sqrt((fi + 0.5) / tapsF);
+        float a = fi * GOLDEN_ANGLE + rotation;
+        sum += content.eval(hit + r * float2(cos(a), sin(a))).rgb * half(w);
+        wsum += w;
+    }
+    half3 avg = sum / half(max(wsum, 1.0));
+    return half4(avg * half(atten), 1.0);
+}

@@ -20,9 +20,11 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityManager
 import android.view.animation.DecelerateInterpolator
+import com.duoopen.fold.DualHingeSource
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.HingeAngleSource
 import com.duoopen.fold.TiltFollower
+import com.duoopen.fold.TriShader
 import com.duoopen.fold.isInnerPanel
 import com.duoopen.settings.DuoSettings
 import kotlinx.coroutines.Dispatchers
@@ -72,6 +74,16 @@ class FoldOverlayService : AccessibilityService() {
     /** Overlay is resolving on a timer, ignoring the hinge (see [show]). */
     private var timedResolve = false
 
+    // --- Tri-fold (two-hinge / three-pane) state ---
+    /** True when the device exposes two hinge sensors (Samsung Galaxy Z TriFold). */
+    private var triMode = false
+    private var dualHinge: DualHingeSource? = null
+    /** Last open/closed state seen from the binary fallback hinge sensor; null until the first event. */
+    private var fallbackOpen: Boolean? = null
+    private var triView: TriFoldOverlayView? = null
+    private var followerLeft: TiltFollower? = null
+    private var followerRight: TiltFollower? = null
+
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
         override fun onDisplayRemoved(displayId: Int) = Unit
@@ -92,6 +104,20 @@ class FoldOverlayService : AccessibilityService() {
         }
     }
 
+    /** Tri-fold stall guard: if neither hinge moved for the timeout and the fold
+     * isn't flat, fade out so a parked half-fold doesn't hide the live screen. */
+    private val triSettleCheck = object : Runnable {
+        override fun run() {
+            val v = triView ?: return
+            if (TriShader.bothFlat(dualHinge?.lastAngleLeft ?: Float.NaN, dualHinge?.lastAngleRight ?: Float.NaN)) return
+            if (!demoRunning && SystemClock.uptimeMillis() - lastHingeMoveMs >= SETTLE_TIMEOUT_TRI_MS) {
+                dismissTri(fadeMs = FADE_OUT_STALLED_MS)
+            } else {
+                handler.postDelayed(this, 150)
+            }
+        }
+    }
+
     /** `adb shell am broadcast -a com.duoopen.DEMO` plays the effect over whatever is on screen. */
     private val demoReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) = playDemo()
@@ -107,18 +133,29 @@ class FoldOverlayService : AccessibilityService() {
         }
         displayManager = getSystemService(DisplayManager::class.java)
         displayManager.registerDisplayListener(displayListener, handler)
-        hinge = HingeAngleSource(this) { onHinge(it) }
-        hinge.start()
-        innerPanel = defaultDisplay().isInnerPanel()
-        Log.i(TAG, "connected; hinge=${hinge.sensor?.name} inner=$innerPanel")
+        // Detect a tri-fold (two hinge sensors) before starting sensors. On a
+        // book-style foldable only one hinge is found, so the original path runs.
+        val tri = DualHingeSource(this) { left, right -> onHingesTri(left, right) }
+        if (tri.isTriFold) {
+            triMode = true
+            dualHinge = tri
+            tri.start()
+            Log.i(TAG, "tri-fold mode; hinges=${tri.sensorNames}")
+        } else {
+            hinge = HingeAngleSource(this) { onHinge(it) }
+            hinge.start()
+            innerPanel = defaultDisplay().isInnerPanel()
+            Log.i(TAG, "book mode; hinge=${hinge.sensor?.name} inner=$innerPanel")
+        }
     }
 
     override fun onDestroy() {
         instance = null
         if (receiverRegistered) unregisterReceiver(demoReceiver)
-        hinge.stop()
+        if (triMode) dualHinge?.stop() else hinge.stop()
         displayManager.unregisterDisplayListener(displayListener)
         removeOverlay()
+        removeTriOverlay()
         scope.cancel()
         super.onDestroy()
     }
@@ -152,7 +189,7 @@ class FoldOverlayService : AccessibilityService() {
      * the second. A capture starts on leaving rest and again on each swap.
      */
     private fun evaluate() {
-        if (demoRunning) return
+        if (demoRunning || triMode) return
         val inner = defaultDisplay().isInnerPanel()
         if (inner != innerPanel) {
             innerPanel = inner
@@ -399,6 +436,7 @@ class FoldOverlayService : AccessibilityService() {
      */
     fun playDemo(durationMs: Long = 1400) {
         if (phase != Phase.IDLE || demoRunning) return
+        if (triMode) { playDemoTri(durationMs); return }
         demoRunning = true
         val inner = innerPanel
         val peak = DuoShader.MAX_TILT * DuoSettings.config.value.intensity.coerceAtMost(1f)
@@ -430,6 +468,258 @@ class FoldOverlayService : AccessibilityService() {
         }, 450)
     }
 
+    // -------------------------------------------------------------------------
+    // Tri-fold state machine (two hinges / three panes). The book path above is
+    // untouched; these methods run only when [triMode] is true.
+    // -------------------------------------------------------------------------
+
+    /** Driven by both hinge sensors. Independent tilts; capture on the first
+     *  hinge to leave 0°, dismiss only when both are flat. */
+    private fun onHingesTri(left: Float, right: Float) {
+        lastHingeMoveMs = SystemClock.uptimeMillis()
+        if (dualHinge?.usingFallback == true) {
+            onFallbackHingeTri(left)
+            return
+        }
+        val config = DuoSettings.config.value
+        val tiltL = TriShader.tiltForHinge(left, config)
+        val tiltR = TriShader.tiltForHinge(right, config)
+        when (phase) {
+            Phase.IDLE -> {
+                if (TriShader.bothFlat(left, right)) {
+                    // Back to flat: arm so the next fold triggers the effect.
+                    restArmed = true
+                } else if (restArmed && (left > TriShader.OPEN_TRIGGER || right > TriShader.OPEN_TRIGGER)) {
+                    restArmed = false
+                    Log.i(TAG, "tri leaving rest; H1=$left H2=$right")
+                    startCaptureTri()
+                }
+            }
+            Phase.SHOWING -> {
+                followerLeft?.setTarget(tiltL)
+                followerRight?.setTarget(tiltR)
+                if (TriShader.bothFlat(left, right) && !demoRunning) {
+                    dismissTri(fadeMs = FADE_OUT_FLAT_MS)
+                }
+            }
+            Phase.CAPTURING -> Unit
+        }
+    }
+
+    /**
+     * The public hinge_angle sensor on the Z TriFold is effectively binary: it
+     * reports exactly 0 (fully closed) or 180 (fully open) and stays silent while
+     * individual panels move. There is no angle to follow, so a closed→open flip
+     * plays the scripted unfold curve instead.
+     */
+    private fun onFallbackHingeTri(angle: Float) {
+        val open = angle >= TriShader.FLAT_HINGE_TRI
+        val wasOpen = fallbackOpen
+        fallbackOpen = open
+        if (wasOpen == false && open && phase == Phase.IDLE && !demoRunning) {
+            Log.i(TAG, "tri fallback unfold; playing scripted curve")
+            playDemoTri()
+        }
+    }
+
+    private fun startCaptureTri() {
+        phase = Phase.CAPTURING
+        captureTri(gen = ++captureGen, attempt = 1, startTiltLeft = null, startTiltRight = null)
+    }
+
+    private fun captureTri(gen: Int, attempt: Int, startTiltLeft: Float?, startTiltRight: Float?) {
+        val t0 = SystemClock.uptimeMillis()
+        fun stale() = gen != captureGen || phase != Phase.CAPTURING
+        fun retry() {
+            val wait = (t0 + SCREENSHOT_MIN_INTERVAL_MS - SystemClock.uptimeMillis()).coerceAtLeast(0L)
+            handler.postDelayed({
+                if (!stale()) captureTri(gen, attempt + 1, startTiltLeft, startTiltRight)
+            }, wait)
+        }
+        handler.postDelayed({
+            if (!stale()) {
+                Log.w(TAG, "tri capture $attempt timed out; giving up")
+                phase = Phase.IDLE
+                demoRunning = false
+            }
+        }, CAPTURE_TIMEOUT_MS)
+        takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+            override fun onSuccess(result: ScreenshotResult) {
+                val buffer = result.hardwareBuffer
+                val bitmap = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace)
+                buffer.close()
+                if (stale()) {
+                    Log.i(TAG, "tri stale capture after ${SystemClock.uptimeMillis() - t0}ms; dropped")
+                    bitmap?.recycle()
+                    return
+                }
+                if (bitmap == null) {
+                    Log.w(TAG, "tri screenshot buffer could not be wrapped")
+                    phase = Phase.IDLE
+                    return
+                }
+                if (attempt >= MAX_CAPTURE_ATTEMPTS) {
+                    onCapturedTri(bitmap, t0, startTiltLeft, startTiltRight)
+                    return
+                }
+                scope.launch {
+                    val black = withContext(Dispatchers.Default) { isMostlyBlack(bitmap) }
+                    if (stale()) {
+                        bitmap.recycle()
+                        return@launch
+                    }
+                    if (black && !demoRunning) {
+                        bitmap.recycle()
+                        Log.i(TAG, "tri capture $attempt is black after ${SystemClock.uptimeMillis() - t0}ms; retrying")
+                        retry()
+                    } else {
+                        onCapturedTri(bitmap, t0, startTiltLeft, startTiltRight)
+                    }
+                }
+            }
+
+            override fun onFailure(errorCode: Int) {
+                if (stale()) return
+                Log.w(TAG, "tri screenshot failed: $errorCode")
+                if (errorCode == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT && attempt < MAX_CAPTURE_ATTEMPTS) {
+                    retry()
+                } else {
+                    phase = Phase.IDLE
+                    demoRunning = false
+                }
+            }
+        })
+    }
+
+    private fun onCapturedTri(bitmap: Bitmap, t0: Long, startTiltLeft: Float?, startTiltRight: Float?) {
+        if (phase != Phase.CAPTURING) {
+            bitmap.recycle()
+            return
+        }
+        val config = DuoSettings.config.value
+        val dh = dualHinge
+        val liveL = TriShader.tiltForHinge(dh?.lastAngleLeft ?: Float.NaN, config)
+        val liveR = TriShader.tiltForHinge(dh?.lastAngleRight ?: Float.NaN, config)
+        val tiltL = startTiltLeft ?: liveL
+        val tiltR = startTiltRight ?: liveR
+        if (tiltL < TriShader.FLAT_EPSILON && tiltR < TriShader.FLAT_EPSILON) {
+            Log.i(TAG, "tri both near flat by capture time (${SystemClock.uptimeMillis() - t0}ms); skipping")
+            bitmap.recycle()
+            phase = Phase.IDLE
+            return
+        }
+        Log.i(TAG, "tri showing ${bitmap.width}x${bitmap.height} L=$tiltL R=$tiltR (${SystemClock.uptimeMillis() - t0}ms)")
+        showTri(bitmap, tiltL, tiltR)
+    }
+
+    private fun showTri(bitmap: Bitmap, startTiltLeft: Float, startTiltRight: Float) {
+        val display = defaultDisplay() ?: run { bitmap.recycle(); phase = Phase.IDLE; return }
+        val wm = windowManager ?: createDisplayContext(display)
+            .createWindowContext(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY, null)
+            .getSystemService(WindowManager::class.java)
+            .also { windowManager = it }
+
+        val view = TriFoldOverlayView(this, bitmap).apply {
+            config = DuoSettings.config.value
+            tiltLeft = startTiltLeft
+            tiltRight = startTiltRight
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            PixelFormat.OPAQUE,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            fitInsetsTypes = 0
+            title = "DuoOpenTriFold"
+        }
+        try {
+            wm.addView(view, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "tri addView failed", e)
+            bitmap.recycle()
+            phase = Phase.IDLE
+            return
+        }
+        triView = view
+        phase = Phase.SHOWING
+        OverlayState.setRunning(true)
+        // Both tilts ease independently; either reaching flat alone isn't enough —
+        // the dismiss check fires from onHingesTri once both are flat.
+        followerLeft = TiltFollower { t -> view.tiltLeft = t }.also { it.snap(startTiltLeft) }
+        followerRight = TiltFollower { t -> view.tiltRight = t }.also { it.snap(startTiltRight) }
+        lastHingeMoveMs = SystemClock.uptimeMillis()
+        handler.postDelayed(triSettleCheck, SETTLE_TIMEOUT_TRI_MS)
+    }
+
+    private fun dismissTri(fadeMs: Long) {
+        val view = triView ?: return
+        Log.i(TAG, "tri dismiss (fade ${fadeMs}ms)")
+        handler.removeCallbacks(triSettleCheck)
+        followerLeft?.cancel()
+        followerRight?.cancel()
+        followerLeft = null
+        followerRight = null
+        triView = null
+        phase = Phase.IDLE
+        restArmed = true
+        view.animate()
+            .alpha(0f)
+            .setDuration(fadeMs)
+            .setInterpolator(DecelerateInterpolator())
+            .withEndAction { detachTri(view) }
+            .start()
+    }
+
+    private fun removeTriOverlay() {
+        phase = Phase.IDLE
+        val view = triView ?: return
+        handler.removeCallbacks(triSettleCheck)
+        followerLeft?.cancel()
+        followerRight?.cancel()
+        followerLeft = null
+        followerRight = null
+        triView = null
+        detachTri(view)
+    }
+
+    private fun detachTri(view: TriFoldOverlayView) {
+        runCatching { windowManager?.removeViewImmediate(view) }
+        OverlayState.setRunning(false)
+    }
+
+    /** Tri demo: both panes start frosted, right (H2) clears first then left (H1). */
+    private fun playDemoTri(durationMs: Long = 1800) {
+        demoRunning = true
+        val peak = TriShader.MAX_TILT * DuoSettings.config.value.intensity.coerceAtMost(1f)
+        phase = Phase.CAPTURING
+        captureTri(gen = ++captureGen, attempt = MAX_CAPTURE_ATTEMPTS, startTiltLeft = peak, startTiltRight = peak)
+        handler.postDelayed({
+            val fl = followerLeft
+            val fr = followerRight
+            if (fl == null || fr == null) {
+                demoRunning = false
+                return@postDelayed
+            }
+            fl.tauS = durationMs / 4000f
+            fr.tauS = durationMs / 4000f
+            // H2 (right) opens first, then H1 (left) — matching the tri-fold unfold order.
+            fr.setTarget(0f)
+            handler.postDelayed({ fl.setTarget(0f) }, (durationMs * 0.45f).toLong())
+            handler.postDelayed({
+                demoRunning = false
+                dismissTri(fadeMs = FADE_OUT_FLAT_MS)
+            }, durationMs)
+        }, 450)
+    }
+
     companion object {
         private const val TAG = "DuoOverlay"
         const val ACTION_DEMO = "com.duoopen.DEMO"
@@ -446,6 +736,8 @@ class FoldOverlayService : AccessibilityService() {
         private const val SKIP_INNER_ABOVE_HINGE = 135f
         private const val SKIP_COVER_BELOW_HINGE = 10f
         private const val SETTLE_TIMEOUT_MS = 700L
+        /** Tri-fold stall timeout: longer than book's — the tri-fold has stable mid-states. */
+        private const val SETTLE_TIMEOUT_TRI_MS = 1200L
         private const val FADE_IN_MS = 140L
         private const val FADE_OUT_FLAT_MS = 120L
         private const val FADE_OUT_STALLED_MS = 300L

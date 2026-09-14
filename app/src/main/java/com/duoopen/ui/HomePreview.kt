@@ -61,6 +61,11 @@ fun HomePreview(
     wallpaperActive: Boolean,
     onSetWallpaper: () -> Unit,
     onTune: () -> Unit,
+    triMode: Boolean = false,
+    hingeLeft: Float = Float.NaN,
+    hingeRight: Float = Float.NaN,
+    tiltLeft: Float = 0f,
+    tiltRight: Float = 0f,
     modifier: Modifier = Modifier,
 ) {
     Box(modifier.fillMaxSize().background(Color(0xFF0D0A1C))) {
@@ -97,14 +102,24 @@ fun HomePreview(
 
             Spacer(Modifier.weight(1f))
 
-            HingeReadout(hingeAngle, paneTilt, simulated)
+            if (triMode) {
+                TriHingeReadout(hingeLeft, hingeRight, tiltLeft, tiltRight, simulated)
+            } else {
+                HingeReadout(hingeAngle, paneTilt, simulated)
+            }
 
             Spacer(Modifier.height(28.dp))
 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                StatTile("Hinge", if (hingeAngle.isNaN()) "—" else "${hingeAngle.roundToInt()}°")
-                StatTile("Pane tilt", "%.1f°".format(paneTilt))
-                StatTile("State", if (paneTilt < 0.05f) "Flat" else "Folding")
+                if (triMode) {
+                    StatTile("H1", if (hingeLeft.isNaN()) "—" else "${hingeLeft.roundToInt()}°")
+                    StatTile("H2", if (hingeRight.isNaN()) "—" else "${hingeRight.roundToInt()}°")
+                    StatTile("State", if (tiltLeft < 0.05f && tiltRight < 0.05f) "Flat" else "Folding")
+                } else {
+                    StatTile("Hinge", if (hingeAngle.isNaN()) "—" else "${hingeAngle.roundToInt()}°")
+                    StatTile("Pane tilt", "%.1f°".format(paneTilt))
+                    StatTile("State", if (paneTilt < 0.05f) "Flat" else "Folding")
+                }
             }
 
             Spacer(Modifier.weight(1f))
@@ -192,6 +207,65 @@ private fun HingeReadout(hingeAngle: Float, paneTilt: Float, simulated: Boolean)
                 fontSize = 64.sp,
                 fontWeight = FontWeight.Bold,
             )
+            Text(hint, color = Dim, fontSize = 14.sp, textAlign = TextAlign.Center)
+        }
+    }
+}
+
+@Composable
+private fun TriHingeReadout(
+    hingeLeft: Float,
+    hingeRight: Float,
+    tiltLeft: Float,
+    tiltRight: Float,
+    simulated: Boolean,
+) {
+    val hint = when {
+        simulated -> "Simulated tri-fold — tune ▸ drag H1 / H2"
+        hingeLeft.isNaN() && hingeRight.isNaN() -> "Waiting for hinge sensors…"
+        tiltLeft < 0.05f && tiltRight < 0.05f -> "Fold the phone partway, then open it"
+        else -> "Keep opening"
+    }
+    Box(
+        Modifier
+            .widthIn(max = 420.dp)
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(28.dp))
+            .background(Glass)
+            .border(1.dp, GlassEdge, RoundedCornerShape(28.dp))
+            .padding(vertical = 22.dp, horizontal = 20.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(
+                "DUO OPEN · TRIFOLD",
+                color = Dim,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                letterSpacing = 3.sp,
+            )
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("H1", color = Dim, fontSize = 12.sp)
+                    Text(
+                        if (hingeLeft.isNaN()) "—" else "${hingeLeft.roundToInt()}°",
+                        color = Color.White,
+                        fontSize = 40.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+                Text("·", color = Dim, fontSize = 40.sp, modifier = Modifier.padding(horizontal = 12.dp))
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("H2", color = Dim, fontSize = 12.sp)
+                    Text(
+                        if (hingeRight.isNaN()) "—" else "${hingeRight.roundToInt()}°",
+                        color = Color.White,
+                        fontSize = 40.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
             Text(hint, color = Dim, fontSize = 14.sp, textAlign = TextAlign.Center)
         }
     }

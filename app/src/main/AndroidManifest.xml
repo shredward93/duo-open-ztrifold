@@ -5,6 +5,12 @@
         android:name="android.software.live_wallpaper"
         android:required="true" />
 
+    <!-- Samsung Z TriFold: its two hinge sensors ("Folding Angle" / "Folding Angle
+         INNER") are declared with com.samsung.permission.SSENSOR. The permission
+         is signature|privileged so a sideloaded app normally can't get it, but
+         we declare it in case the HAL doesn't enforce it on this device. -->
+    <uses-permission android:name="com.samsung.permission.SSENSOR" />
+
     <application
         android:name=".DuoApplication"
         android:allowBackup="true"

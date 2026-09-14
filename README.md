@@ -80,15 +80,19 @@ watch it with `adb logcat -s DuoOverlay`.
 
 ```
 app/src/main/res/raw/duo_unfold.agsl      fold shader (hinge line, moving side, eye)
+app/src/main/res/raw/tri_unfold.agsl       three-pane tri-fold shader (left/center/right)
 fold/DuoShader.kt                         uniforms, hinge→tilt mapping, fold placement
+fold/TriShader.kt                         tri-fold uniforms, hinge→tilt, thirds geometry
 fold/HingeAngleSource.kt                  TYPE_HINGE_ANGLE (wake-up fallback, vendor fallback)
+fold/DualHingeSource.kt                   two-hinge discovery (H1/H2) for the Z TriFold
 fold/TiltFollower.kt                      per-vsync ease that hides the sensor's 1° steps
 fold/Panels.kt                            inner vs cover panel from the display mode
-overlay/FoldOverlayService.kt             accessibility service: screenshot + overlay
+overlay/FoldOverlayService.kt             accessibility service: screenshot + overlay (book + tri)
 overlay/FoldOverlayView.kt                draws the snapshot through the shader (half-res layer)
-wallpaper/DuoWallpaperService.kt          live wallpaper engine
+overlay/TriFoldOverlayView.kt             two-tilt overlay view for the tri-fold
+wallpaper/DuoWallpaperService.kt          live wallpaper engine (book + tri)
 wallpaper/WallpaperImage.kt               picked image / generated default
-ui/                                       Compose app: preview, Tune sheet
+ui/                                       Compose app: preview, Tune sheet (book + tri)
 settings/DuoSettings.kt                   shared tuning (SharedPreferences + StateFlow)
 ```
 
@@ -99,6 +103,41 @@ settings/DuoSettings.kt                   shared tuning (SharedPreferences + Sta
 - The hinge sensor is wake-up only and sends nothing on registration, goes
   quiet at ~30° during a close, and idles anywhere from 0–5° when shut. The
   service compensates for all three.
+
+## Samsung Galaxy Z TriFold notes
+
+> **Status: does not work on a real Z TriFold.** The two per-hinge angle
+> sensors require `com.samsung.permission.SSENSOR` (signature|privileged),
+> and the public `hinge_angle` sensor only reports 0 or 180. See
+> [TRIFOLD_FINDINGS.md](TRIFOLD_FINDINGS.md) for the full investigation.
+> The code below is complete and should work if that permission ever becomes
+> obtainable (root / priv-app).
+
+The tri-fold has a U-shaped fold: two hinges (left H1, right H2) and three
+panels (left / center / right). The app keeps the original book-fold path and
+adds a tri-fold path selected at runtime by hinge-sensor count — two or more
+hinge sensors run the three-pane shader; one or none falls back to the
+two-pane behavior above.
+
+- **Sensor discovery**: `SensorManager.getDefaultSensor(TYPE_HINGE_ANGLE)`
+  returns only one hinge even on a two-hinge device, so the full sensor list is
+  enumerated. Left (H1) vs right (H2) is inferred from the sensor name
+  ("1"/"left"/"h1" → left, "2"/"right"/"h2" → right), falling back to
+  enumeration order. Verify and correct the mapping with
+  `adb shell dumpsys sensorservice | grep -i hinge` and
+  `adb logcat -s DuoHinge` (logs the discovered hinge sensors and their
+  left/right assignment at service connect).
+- **Shader**: three vertical regions; the center pane is anchored and crisp,
+  the left pane frosts/darkens from H1, the right pane from H2. The right pane
+  clears first during an unfold (H2 opens 0→180), then the left (H1 follows).
+- **State machine**: one screenshot is captured the moment either hinge
+  leaves 0°; the overlay holds across the full canvas piping both hinge angles
+  to the shader, and drops only when both hinges reach ~178° (real hinge HALs
+  rest short of 180°, so a literal 180° would never dismiss). If the fold parks
+  partway the overlay fades out after ~1.2 s so the live screen isn't hidden.
+- **Preview / Tune**: the in-app preview and Tune sheet show both hinge readouts
+  and a Book/Tri simulate toggle, so the three-pane shader can be previewed on
+  any device (or emulator) without two real hinges.
 
 ## License
 

@@ -34,9 +34,11 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.duoopen.fold.DualHingeSource
 import com.duoopen.fold.DuoShader
 import com.duoopen.fold.FoldLine
 import com.duoopen.fold.HingeAngleSource
+import com.duoopen.fold.TriShader
 import com.duoopen.fold.isInnerPanel
 import com.duoopen.overlay.FoldOverlayService
 import com.duoopen.overlay.OverlayState
@@ -78,6 +80,38 @@ fun DuoApp(foldLineFlow: StateFlow<FoldLine?>) {
 
     val shader = remember { DuoShader.create(context) }
     val pxPerMm = remember(context) { DuoShader.pxPerMm(context) }
+
+    // Tri-fold (two-hinge / three-pane): live on a Z TriFold, or force-previewable
+    // on any device via the Book/Tri simulate toggle in the Tune sheet.
+    var hingeLeft by remember { mutableFloatStateOf(Float.NaN) }
+    var hingeRight by remember { mutableFloatStateOf(Float.NaN) }
+    val dualProbe = remember {
+        DualHingeSource(context.applicationContext) { l, r -> hingeLeft = l; hingeRight = r }
+    }
+    DisposableEffect(dualProbe) {
+        dualProbe.start()
+        onDispose { dualProbe.stop() }
+    }
+    val deviceTri = dualProbe.isTriFold
+    var simulateTri by rememberSaveable { mutableStateOf(false) }
+    val triMode = deviceTri || simulateTri
+    var simulatedLeft by rememberSaveable { mutableFloatStateOf(120f) }
+    var simulatedRight by rememberSaveable { mutableFloatStateOf(150f) }
+    val triLeftAngle = if (simulateTri || !deviceTri) simulatedLeft else hingeLeft
+    val triRightAngle = if (simulateTri || !deviceTri) simulatedRight else hingeRight
+    val targetTiltLeft = if (triLeftAngle.isNaN()) 0f else TriShader.tiltForHinge(triLeftAngle, config)
+    val targetTiltRight = if (triRightAngle.isNaN()) 0f else TriShader.tiltForHinge(triRightAngle, config)
+    val tiltLeft by animateFloatAsState(
+        targetValue = targetTiltLeft,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 900f),
+        label = "tiltLeft",
+    )
+    val tiltRight by animateFloatAsState(
+        targetValue = targetTiltRight,
+        animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 900f),
+        label = "tiltRight",
+    )
+    val triShader = remember { TriShader.create(context) }
     val image by produceState<ImageBitmap?>(null, config.imageVersion) {
         value = withContext(Dispatchers.IO) {
             WallpaperImage.load(context.applicationContext, config.imageVersion).asImageBitmap()
@@ -116,8 +150,26 @@ fun DuoApp(foldLineFlow: StateFlow<FoldLine?>) {
             wallpaperActive = wallpaperActive,
             onSetWallpaper = setWallpaper,
             onTune = { showSheet = true },
-            modifier = if (shader != null && !overlayRunning) {
-                Modifier.foldEffect(shader, { paneTilt }, config, pxPerMm, foldLine)
+            triMode = triMode,
+            hingeLeft = triLeftAngle,
+            hingeRight = triRightAngle,
+            tiltLeft = tiltLeft,
+            tiltRight = tiltRight,
+            modifier = if (!overlayRunning) {
+                if (triMode && triShader != null) {
+                    Modifier.triFoldEffect(
+                        triShader,
+                        { tiltLeft },
+                        { tiltRight },
+                        config,
+                        pxPerMm,
+                        null,
+                    )
+                } else if (shader != null) {
+                    Modifier.foldEffect(shader, { paneTilt }, config, pxPerMm, foldLine)
+                } else {
+                    Modifier
+                }
             } else {
                 Modifier
             },
@@ -154,6 +206,19 @@ fun DuoApp(foldLineFlow: StateFlow<FoldLine?>) {
                     }
                 },
                 onDismiss = { showSheet = false },
+                triMode = triMode,
+                deviceTri = deviceTri,
+                simulateTri = simulateTri,
+                onSimulateTriChange = { simulateTri = it },
+                hingeSensorNames = dualProbe.sensorNames,
+                hingeLeft = triLeftAngle,
+                hingeRight = triRightAngle,
+                tiltLeft = tiltLeft,
+                tiltRight = tiltRight,
+                simulatedLeft = simulatedLeft,
+                simulatedRight = simulatedRight,
+                onSimulatedLeftChange = { simulatedLeft = it },
+                onSimulatedRightChange = { simulatedRight = it },
             )
         }
     }
